@@ -78,7 +78,7 @@
 			  (cons 'user (user-alist conn user))
 			  #f)
 		  (if channel
-			  (if (get-keyword #:channel-long args)
+			  (if (get-keyword #:long-channel args)
 				   (cons 'channel (channel-alist conn channel))
 				   (cons 'channel (channel-alist-short conn channel)))
 			  #f)))))
@@ -87,11 +87,15 @@
 ;; Hook function for irc:loop; handles all IRC commands
 (define (on-command conn cmd params #!optional sender)
   (cond
-   ([string=? cmd "PRIVMSG"]
-	(let ([msg (last params)]
-		  [channel (first params)]
-		  [user (irc:hostmask-nick sender)])
-	  (json-write (compose-event-alist conn "message" #:content msg #:user user #:channel channel)))))
+   [(string=? cmd "PRIVMSG")
+	(json-write
+	 (compose-event-alist conn "message" #:channel (car params)
+						  #:text (last params) #:user (irc:hostmask-nick sender)))]
+   [(string=? cmd "JOIN")
+	(json-write
+	 (compose-event-alist conn "room-join" #:channel (car params)
+						  #:user (irc:hostmask-nick sender)))])
+
   (print sender ":" cmd params))
 
 
@@ -103,10 +107,8 @@
 	   (irc:write-cmd conn "JOIN" "#thevoid")]
 	  [(or (eq? reply RPL_TOPIC)
 		   (eq? reply RPL_ENDOFWHO))
-	   (let* ([channel (second params)]
-			  [alist (compose-event-alist conn "room-info" #:channel channel #:long-channel #t)])
-		 (pretty-print alist)
-		 (json-write alist))]))
+	   (json-write
+		(compose-event-alist conn "room-info" #:channel (second params) #:long-channel #t))]))
 
 
 (define *help-msg*
