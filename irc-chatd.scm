@@ -16,25 +16,97 @@
 ;;
 
 (import scheme
-		(chicken file) (chicken file posix) (chicken io) (chicken process-context)
+		(chicken file) (chicken file posix) (chicken io) (chicken keyword)
+		(chicken pretty-print) (chicken process-context)
 		(chicken process-context posix) (chicken string)
-		srfi-1 srfi-69
+		srfi-1 srfi-69 srfi-180
 		ircc
-		json
 		getopt-long)
 
 
+;; Return a user-info in chatd-friendly alist-format, by its alist
+(define (user-alist conn nick)
+  (let* ([ircc-alist (irc:user-alist conn nick)]
+		 [hostmask (alist-ref 'hostmask ircc-alist)])
+	(if (not hostmask)
+		(list (cons 'name nick)))
+		(list (cons 'name nick)
+			  (cons 'id hostmask))))
+
+
+;; Return an IRC room in chatd-amicable alist-format, using its hashtable
+(define (channel-alist conn channel)
+  (let ([channel-table (irc:channel-table conn channel)])
+;;	(pretty-print (hash-table-ref channel-table 'users))
+	(list
+	 (cons 'id channel)
+	 (cons 'name channel)
+	 (cons 'topic (hash-table-ref channel-table 'topic))
+	  (cons 'users
+			(map
+			 (lambda (nick)
+			   (cons 'user (user-alist conn nick)))
+			 (hash-table-ref channel-table 'users))))))
+
+
+;; Returns a channel's chatd-friendly alist format, but solely with ID
+(define (channel-alist-short conn channel)
+  (list
+   (cons 'id channel)
+   (cons 'name channel)))
+
+
+;; Used for creating chatd-format messages
+;; The optional args are key-value pairs, as follows:
+;; #:text #:id #:user #:channel #:long-channel #:additional
+(define (compose-event-alist conn event . args)
+  (let ([text (get-keyword #:text args)]
+		[user (get-keyword #:user args)]
+		[channel (get-keyword #:channel args)]
+		[additional (get-keyword #:additional args)])
+  (filter
+   (lambda (item) (not (eq? #f item)))
+;;	(if additional additional list)
+	(list (cons 'event event)
+;;		  (if additional additional #f)
+		  (if text
+			  (cons 'content
+					(list (cons 'type "plain/text")
+						  (cons 'body text)))
+			  #f)
+		  (if user
+			  (cons 'user (user-alist conn user))
+			  #f)
+		  (if channel
+			  (if (get-keyword #:channel-long args)
+				   (cons 'channel (channel-alist conn channel))
+				   (cons 'channel (channel-alist-short conn channel)))
+			  #f)))))
+
+
+;; Hook function for irc:loop; handles all IRC commands
 (define (on-command conn cmd params #!optional sender)
+  (cond
+   ([string=? cmd "PRIVMSG"]
+	(let ([msg (last params)]
+		  [channel (first params)]
+		  [user (irc:hostmask-nick sender)])
+	  (json-write (compose-event-alist conn "message" #:content msg #:user user #:channel channel)))))
   (print sender ":" cmd params))
 
 
+;; Hook function for irc:loop; handles all IRC errors and replies
 (define (on-reply conn reply params #!optional sender)
-  (print (hash-table->alist conn))
-  (print (hash-table->alist (hash-table-ref conn 'users)))
-;;  (print sender ":" reply params)
+;;  (pretty-print (list reply params sender))
   (cond
       [(eq? reply RPL_WELCOME)
-	(irc:write-cmd conn "JOIN" "#thevoid")]))
+	   (irc:write-cmd conn "JOIN" "#thevoid")]
+	  [(or (eq? reply RPL_TOPIC)
+		   (eq? reply RPL_ENDOFWHO))
+	   (let* ([channel (second params)]
+			  [alist (compose-event-alist conn "room-info" #:channel channel #:long-channel #t)])
+		 (pretty-print alist)
+		 (json-write alist))]))
 
 
 (define *help-msg*
