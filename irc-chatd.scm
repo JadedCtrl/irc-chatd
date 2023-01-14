@@ -24,29 +24,38 @@
 		getopt-long)
 
 
+;; Write a to-be-JSON alist to the appropriate output
+(define (chatd-json-write conn alist)
+  (json-write alist)
+  (print "\n"))
+
+
 ;; Return a user-info in chatd-friendly alist-format, by its alist
 (define (user-alist conn nick)
   (let* ([ircc-alist (irc:user-alist conn nick)]
 		 [hostmask (alist-ref 'hostmask ircc-alist)])
 	(if (not hostmask)
-		(list (cons 'name nick)))
+		(list (cons 'name nick))
 		(list (cons 'name nick)
-			  (cons 'id hostmask))))
+			  (cons 'id (irc:hostmask-userhost hostmask))))))
 
 
 ;; Return an IRC room in chatd-amicable alist-format, using its hashtable
 (define (channel-alist conn channel)
   (let ([channel-table (irc:channel-table conn channel)])
-;;	(pretty-print (hash-table-ref channel-table 'users))
-	(list
-	 (cons 'id channel)
-	 (cons 'name channel)
-	 (cons 'topic (hash-table-ref channel-table 'topic))
+	(filter
+	 (lambda (item) item)
+	 (list
+	  (cons 'id channel)
+	  (cons 'name channel)
+	  (cons 'topic (if (hash-table-exists? channel-table 'topic)
+					   (hash-table-ref channel-table 'topic)
+					   #f))
 	  (cons 'users
 			(map
 			 (lambda (nick)
 			   (cons 'user (user-alist conn nick)))
-			 (hash-table-ref channel-table 'users))))))
+			 (hash-table-ref channel-table 'users)))))))
 
 
 ;; Returns a channel's chatd-friendly alist format, but solely with ID
@@ -88,26 +97,39 @@
 (define (on-command conn cmd params #!optional sender)
   (cond
    [(string=? cmd "PRIVMSG")
-	(json-write
-	 (compose-event-alist conn "message" #:channel (car params)
-						  #:text (last params) #:user (irc:hostmask-nick sender)))]
+	(let ([target (if (irc:user-is-self? conn (car params))
+					  (irc:hostmask-nick sender)
+					  (car params))])
+	  (chatd-json-write conn
+	   (compose-event-alist conn "message" #:channel target
+							#:text (last params) #:user (irc:hostmask-nick sender))))]
    [(string=? cmd "JOIN")
-	(json-write
+	(chatd-json-write conn
 	 (compose-event-alist conn "room-join" #:channel (car params)
-						  #:user (irc:hostmask-nick sender)))])
-
-  (print sender ":" cmd params))
+						  #:user (irc:hostmask-nick sender)))]
+   [(string=? cmd "NICK")
+	(chatd-json-write conn
+	 (compose-event-alist conn "user-info" #:user (last params)))])
+)
+;;  (pretty-print (list sender ":" cmd params)))
 
 
 ;; Hook function for irc:loop; handles all IRC errors and replies
 (define (on-reply conn reply params #!optional sender)
-;;  (pretty-print (list reply params sender))
+;;    (pretty-print (list reply params sender))
   (cond
       [(eq? reply RPL_WELCOME)
 	   (irc:write-cmd conn "JOIN" "#thevoid")]
-	  [(or (eq? reply RPL_TOPIC)
-		   (eq? reply RPL_ENDOFWHO))
-	   (json-write
+
+	  ;; After receiving a user-list or topic update, tell the user!
+	  [(let ([channel (second params)])
+		 (and (irc:channel? channel)
+			  (or (eq? reply RPL_TOPIC)
+				  (eq? reply RPL_TOPICWHOTIME)
+				  (and (irc:capability? conn 'userhost-in-names)
+					   (eq? reply RPL_ENDOFNAMES))
+				  (eq? reply RPL_ENDOFWHO))))
+	   (chatd-json-write conn
 		(compose-event-alist conn "room-info" #:channel (second params) #:long-channel #t))]))
 
 
