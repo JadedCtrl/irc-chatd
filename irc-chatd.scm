@@ -19,7 +19,7 @@
 		(chicken file) (chicken file posix) (chicken io) (chicken keyword)
 		(chicken pretty-print) (chicken process-context)
 		(chicken process-context posix) (chicken string)
-		srfi-1 srfi-69 srfi-180
+		srfi-1 srfi-13 srfi-69 srfi-180
 		ircc
 		getopt-long)
 
@@ -96,13 +96,23 @@
 ;; Hook function for irc:loop; handles all IRC commands
 (define (on-command conn cmd params #!optional sender)
   (cond
-   [(string=? cmd "PRIVMSG")
+   [(and (string=? cmd "PRIVMSG")
+		 (string? sender)
+		 (irc:hostmask? sender))
 	(let ([target (if (irc:user-is-self? conn (car params))
 					  (irc:hostmask-nick sender)
 					  (car params))])
 	  (chatd-json-write conn
 	   (compose-event-alist conn "message" #:channel target
 							#:text (last params) #:user (irc:hostmask-nick sender))))]
+
+   [(or (string=? cmd "NOTICE")
+		(and (string=? cmd "PRIVMSG")
+			 (or (string-null? sender) (not (irc:hostmask? sender)))))
+	(chatd-json-write conn
+	  (compose-event-alist conn "server-message"
+						   #:text (last params)))]
+
    [(string=? cmd "JOIN")
 	(chatd-json-write conn
 	 (compose-event-alist conn "room-join" #:channel (car params)
@@ -111,12 +121,11 @@
 	(chatd-json-write conn
 	 (compose-event-alist conn "user-info" #:user (last params)))])
 )
-;;  (pretty-print (list sender ":" cmd params)))
+
 
 
 ;; Hook function for irc:loop; handles all IRC errors and replies
 (define (on-reply conn reply params #!optional sender)
-;;    (pretty-print (list reply params sender))
   (cond
       [(eq? reply RPL_WELCOME)
 	   (irc:write-cmd conn "JOIN" "#thevoid")]
@@ -130,7 +139,9 @@
 					   (eq? reply RPL_ENDOFNAMES))
 				  (eq? reply RPL_ENDOFWHO))))
 	   (chatd-json-write conn
-		(compose-event-alist conn "room-info" #:channel (second params) #:long-channel #t))]))
+		(compose-event-alist conn "room-info" #:channel (second params) #:long-channel #t))])
+  (chatd-json-write conn
+   (compose-event-alist conn "server-message" #:text (last params))))
 
 
 (define *help-msg*
