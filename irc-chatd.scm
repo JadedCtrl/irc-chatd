@@ -26,8 +26,14 @@
 
 ;; Write a to-be-JSON alist to the appropriate output
 (define (chatd-json-write conn alist)
-  (json-write alist)
-  (print "\n"))
+  (let* ([configured-output? (hash-table-exists? conn 'output)]
+		 [output (if configured-output?
+					 (open-output-file (hash-table-ref conn 'output))
+					 (open-output-file* fileno/stdout))])
+	(json-write alist output)
+	(write-string "\n" #f output)
+	(if configured-output?
+		(close-output-port output))))
 
 
 ;; Return a user-info in chatd-friendly alist-format, by its alist
@@ -174,13 +180,18 @@
 	 (value (required PASSWORD)))
 	(name
 	 "Set the realname of your connection."
-	 (value (required NAME)))))
+	 (value (required NAME)))
+	(output
+	 "Output path for messages. Defaults to standard output."
+	 (single-char #\o)
+	 (value (required PATH)))))
 
 
 ;; Prints cli usage to stderr.
 (define (help)
   (write-string *help-msg* #f (open-output-file* fileno/stderr))
-  (write-string (usage *opts*) #f (open-output-file* fileno/stderr)))
+  (write-string (usage *opts*) #f (open-output-file* fileno/stderr))
+  (exit 1))
 
 
 ;; The `main` procedure that should be called to run feedsnake-unix for use as script.
@@ -188,23 +199,33 @@
   (let* ([args (getopt-long (command-line-arguments) *opts*)]
 		 [free-args (alist-ref '@ args)])
 	(if (or (null? free-args) (alist-ref 'help args))
-		(help)
-		(let*
-			([username (or (alist-ref 'username args)
-						   (current-effective-user-name))]
-			 [password (alist-ref 'password args)]
-			 [nickname (or (alist-ref 'nickname args)
-						   (current-effective-user-name))]
-			 [fullname (alist-ref 'name args)]
-			 [server (last free-args)]
-			 [hostname (first (string-split server ":"))]
-			 [port (or (string->number (last (string-split server ":")))
-					   6697)])
-		  (if server
-			  (irc:loop (irc:connect server port username nickname password fullname)
-						on-command
-						on-reply)
-			  (help))))))
+		(help))
+
+	(let*
+		([username (or (alist-ref 'username args)
+					   (current-effective-user-name))]
+		 [password (alist-ref 'password args)]
+		 [nickname (or (alist-ref 'nickname args)
+					   (current-effective-user-name))]
+		 [fullname (alist-ref 'name args)]
+		 [server (last free-args)]
+		 [hostname (first (string-split server ":"))]
+		 [port (or (string->number (last (string-split server ":")))
+				   6697)]
+		 [output (alist-ref 'output args)]
+		 [connection (if server
+						 (irc:connect server port username nickname password fullname)
+						 #f)])
+
+	  (unless connection
+		(help))
+
+	  (if output
+		  (hash-table-set! connection 'output output))
+
+	  (irc:loop connection
+				on-command
+				on-reply))))
 
 
 (main)
