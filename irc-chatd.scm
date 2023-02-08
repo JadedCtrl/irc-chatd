@@ -32,14 +32,37 @@
 
 
 ;; Returns the .users/ path of a channel
-(define (users-directory-path conn channel)
+(define (channel-users-directory-path conn channel)
   (string-append (channel-directory-path conn channel)
 				 ".users/"))
 
 
+;; Main directory path of the given user
+(define (channel-user-directory-path conn channel hostmask #!optional (state "all"))
+  (string-append (channel-users-directory-path conn channel)
+				 state "/" (irc:hostmask-nick hostmask)))
+
+
+;; Main directory path of the given user
+(define (user-directory-path conn channel hostmask)
+  (string-append (channel-users-directory-path conn channel)
+				 "all/" hostmask))
+
+
 ;; Tidies up a channel directory; removes `online` and `offline` user links, etc.
 (define (cleanup-channel conn channel)
-  #t)
+  (let ([users-dir (channel-users-directory-path conn channel)])
+	(map
+	 (lambda (state-dir)
+	   (if (not (substring-index state-dir "/all"))
+		   (map
+			(lambda (link)
+			  (let ([link-path (string-append users-dir state-dir "/" link)])
+				(if (symbolic-link? link-path)
+					(delete-file link-path))))
+			(directory (string-append users-dir state-dir)))))
+	   (directory users-dir))))
+
 
 
 ;; Creates a channel's file hierarchy, if need be
@@ -53,18 +76,30 @@
 
 ;; Creates a user's info files in the given channel, if need bee
 (define (make-user conn channel hostmask)
-  (let ([path (string-append (channel-directory-path conn channel)
-							 "/.users/all/"
-							 (irc:hostmask-nick hostmask) "/")])
-	(create-directory path #t)
-	(call-with-output-file (string-append path "hostmask")
-	  (lambda (out-port)
-		(write-string hostmask #f out-port)))))
+  (create-directory (user-directory-path conn channel hostmask) #t))
 
 
-;; Removes/Adds a symbolic link to a subdirectory of users/ named `state`.
-(define (user-toggle-state conn channel user state)
-  #f)
+;; Disables a user-state (that is, removes a symlink from a .users directory
+(define (user-disable-state conn channel hostmask state)
+  (let ([state-link (channel-user-directory-path conn channel hostmask state)])
+	(if (or (file-exists? state-link)
+			(symbolic-link? state-link))
+		(delete-file state-link))))
+
+
+;; Enables a user-state (that is, makes a symlink to a .users directory
+(define (user-enable-state conn channel hostmask state)
+  (let ([state-link (channel-user-directory-path conn channel hostmask state)])
+	(if (not (or (file-exists? state-link)
+				 (symbolic-link? state-link)))
+		(create-symbolic-link (string-append "../all/" hostmask)
+							  state-link))))
+
+
+;; Ensures the enabled-state is enabled, and it's opposite (disabled-state) is not
+(define (user-toggle-state conn channel hostmask enabled-state disabled-state)
+  (user-disable-state conn channel hostmask disabled-state)
+  (user-enable-state conn channel hostmask enabled-state))
 
 
 ;; Returns the appropriate, non-colliding file path of a hypothetical message
@@ -151,8 +186,10 @@
 				(eq? reply RPL_ENDOFNAMES))
 		   (eq? reply RPL_ENDOFWHO))
 	   (map (lambda (nick)
-			  (make-user conn (second params)
-							   (irc:user-get conn nick 'hostmask)))
+			  (let ([hostmask (irc:user-get conn nick 'hostmask)]
+					[channel (second params)])
+				(make-user conn channel hostmask)
+				(user-toggle-state conn channel hostmask "online" "offline")))
 			(irc:channel-users conn (second params)))]
 
 	  [#t
