@@ -16,87 +16,91 @@
 ;;
 
 (import scheme
-		(chicken file) (chicken file posix) (chicken io) (chicken keyword)
+		(chicken file) (chicken file posix) (chicken io) (chicken keyword) (chicken random)
 		(chicken pretty-print) (chicken process-context)
 		(chicken process-context posix) (chicken string)
-		srfi-1 srfi-13 srfi-69 srfi-180
+		srfi-1 srfi-13 srfi-19 srfi-69 srfi-180
 		ircc
+		xattr
 		getopt-long)
 
 
-;; Write a to-be-JSON alist to the appropriate output
-(define (chatd-json-write conn alist)
-  (let* ([configured-output? (hash-table-exists? conn 'output)]
-		 [output (if configured-output?
-					 (open-output-file (hash-table-ref conn 'output))
-					 (open-output-file* fileno/stdout))])
-	(json-write alist output)
-	(write-string "\n" #f output)
-	(if configured-output?
-		(close-output-port output))))
+;; Returns the path of a channel's directory
+(define (channel-directory-path conn channel)
+  (string-append (hash-table-ref conn 'directory)
+				 "/" channel "/"))
 
 
-;; Return a user-info in chatd-friendly alist-format, by its alist
-(define (user-alist conn nick)
-  (let* ([ircc-alist (irc:user-alist conn nick)]
-		 [hostmask (alist-ref 'hostmask ircc-alist)])
-	(if (not hostmask)
-		(list (cons 'name nick))
-		(list (cons 'name nick)
-			  (cons 'id (irc:hostmask-userhost hostmask))))))
+;; Returns the .users/ path of a channel
+(define (users-directory-path conn channel)
+  (string-append (channel-directory-path conn channel)
+				 ".users/"))
 
 
-;; Return an IRC room in chatd-amicable alist-format, using its hashtable
-(define (channel-alist conn channel)
-  (let ([channel-table (irc:channel-table conn channel)])
-	(filter
-	 (lambda (item) item)
-	 (list
-	  (cons 'id channel)
-	  (cons 'name channel)
-	  (cons 'topic (if (hash-table-exists? channel-table 'topic)
-					   (hash-table-ref channel-table 'topic)
-					   #f))
-	  (cons 'users
-			(map
-			 (lambda (nick)
-			   (cons 'user (user-alist conn nick)))
-			 (hash-table-ref channel-table 'users)))))))
+;; Tidies up a channel directory; removes `online` and `offline` user links, etc.
+(define (cleanup-channel conn channel)
+  #t)
 
 
-;; Returns a channel's chatd-friendly alist format, but solely with ID
-(define (channel-alist-short conn channel)
-  (list
-   (cons 'id channel)
-   (cons 'name channel)))
+;; Creates a channel's file hierarchy, if need be
+(define (make-channel conn channel)
+  (let ([path (channel-directory-path conn channel)])
+	(create-directory (string-append path "/.users/online") #t)
+	(create-directory (string-append path "/.users/offline") #t)
+	(create-directory (string-append path "/.users/all") #t)
+	(cleanup-channel conn channel)))
 
 
-;; Used for creating chatd-format messages
-;; The optional args are key-value pairs, as follows:
-;; #:text #:id #:user #:channel #:long-channel #:additional
-(define (compose-event-alist conn event . args)
-  (let ([text (get-keyword #:text args)]
-		[user (get-keyword #:user args)]
-		[channel (get-keyword #:channel args)]
-		[additional (get-keyword #:additional args)])
-  (filter
-   (lambda (item) (not (eq? #f item)))
-;;	(if additional additional list)
-	(list (cons 'event event)
-;;		  (if additional additional #f)
-		  (if text
-			  (cons 'content
-					(list (cons 'type "plain/text")
-						  (cons 'body text)))
-			  #f)
-		  (if user
-			  (cons 'user (user-alist conn user))
-			  #f)
-		  (if channel
-			  (if (get-keyword #:long-channel args)
-				   (cons 'channel (channel-alist conn channel))
-				   (cons 'channel (channel-alist-short conn channel)))
-			  #f)))))
+;; Creates a user's info files in the given channel, if need bee
+(define (make-user conn channel hostmask)
+  (let ([path (string-append (channel-directory-path conn channel)
+							 "/.users/all/"
+							 (irc:hostmask-nick hostmask) "/")])
+	(create-directory path #t)
+	(call-with-output-file (string-append path "hostmask")
+	  (lambda (out-port)
+		(write-string hostmask #f out-port)))))
+
+
+;; Removes/Adds a symbolic link to a subdirectory of users/ named `state`.
+(define (user-toggle-state conn channel user state)
+  #f)
+
+
+;; Returns the appropriate, non-colliding file path of a hypothetical message
+(define (message-file-path conn channel #!optional (suffix ""))
+  (let ([path
+		 (string-append (channel-directory-path conn channel)
+						(date->string (current-date) "[~m-~d] ~H:~M:~S")
+						suffix)])
+	(if (file-exists? path)
+		(message-file-path conn channel
+						   (number->string (+ (or (string->number suffix) 0) .1)))
+		path)))
+
+
+;; Create a message file; putting metadata in xattrs, and text directly in the file
+(define (make-message-file conn channel sender message)
+  (let ([file (message-file-path conn channel)])
+	(call-with-output-file file
+	  (lambda (out-port) (write-string message #f out-port)))
+	(set-xattr file "user.chat.sender" sender)
+	(set-xattr file "user.chat.date" (date->string (current-date) "~1T~2"))
+	(set-xattr file "user.chat.channel" channel)
+	(set-xattr file "user.chat.mime" "text/plain")))
+
+
+;; Sets a channel's .topic file
+(define (set-channel-topic conn channel topic #!optional (username #f) (date #f))
+  (let ([topic-path (string-append (channel-directory-path conn channel)
+								   ".topic")])
+	(if (string? topic)
+		(call-with-output-file
+			topic-path
+		  (lambda (out-port)
+			(write-string topic #f out-port))))
+	(if username
+		(set-xattr topic-path "user.chat.sender" (irc:hostmask-nick username)))))
 
 
 ;; Hook function for irc:loop; handles all IRC commands
@@ -108,26 +112,23 @@
 	(let ([target (if (irc:user-is-self? conn (car params))
 					  (irc:hostmask-nick sender)
 					  (car params))])
-	  (chatd-json-write conn
-	   (compose-event-alist conn "message" #:channel target
-							#:text (last params) #:user (irc:hostmask-nick sender))))]
+	  (make-message-file conn target (irc:hostmask-nick sender) (last params)))]
 
    [(or (string=? cmd "NOTICE")
 		(and (string=? cmd "PRIVMSG")
 			 (or (string-null? sender) (not (irc:hostmask? sender)))))
-	(chatd-json-write conn
-	  (compose-event-alist conn "server-message"
-						   #:text (last params)))]
+	(make-message-file conn ".server" "server" (last params))]
+
+   [(and (string=? cmd "JOIN") (irc:user-is-self? conn sender))
+	(make-channel conn (last params))]
 
    [(string=? cmd "JOIN")
-	(chatd-json-write conn
-	 (compose-event-alist conn "room-join" #:channel (car params)
-						  #:user (irc:hostmask-nick sender)))]
-   [(string=? cmd "NICK")
-	(chatd-json-write conn
-	 (compose-event-alist conn "user-info" #:user (last params)))])
-)
+	(make-user conn (last params) sender)]
 
+;;   [(string=? cmd "NICK")
+;;	(chatd-json-write conn
+;;	 (compose-event-alist conn "user-info" #:user (last params)))])
+))
 
 
 ;; Hook function for irc:loop; handles all IRC errors and replies
@@ -136,18 +137,26 @@
       [(eq? reply RPL_WELCOME)
 	   (irc:write-cmd conn "JOIN" "#thevoid")]
 
-	  ;; After receiving a user-list or topic update, tell the user!
-	  [(let ([channel (second params)])
-		 (and (irc:channel? channel)
-			  (or (eq? reply RPL_TOPIC)
-				  (eq? reply RPL_TOPICWHOTIME)
-				  (and (irc:capability? conn 'userhost-in-names)
-					   (eq? reply RPL_ENDOFNAMES))
-				  (eq? reply RPL_ENDOFWHO))))
-	   (chatd-json-write conn
-		(compose-event-alist conn "room-info" #:channel (second params) #:long-channel #t))])
-  (chatd-json-write conn
-   (compose-event-alist conn "server-message" #:text (last params))))
+	  ;; If topic set, output to a channel's .topic file
+	  [(and (eq? reply RPL_TOPIC)
+			(irc:channel? (second params)))
+	   (set-channel-topic conn (second params) (last params))]
+
+	  [(and (eq? reply RPL_TOPICWHOTIME)
+			(irc:channel? (second params)))
+	   (set-channel-topic conn (second params) #f (third params) (last params))]
+
+	  ;; We've got to add users, when they join the room!
+	  [(or (and (irc:capability? conn 'userhost-in-names)
+				(eq? reply RPL_ENDOFNAMES))
+		   (eq? reply RPL_ENDOFWHO))
+	   (map (lambda (nick)
+			  (make-user conn (second params)
+							   (irc:user-get conn nick 'hostmask)))
+			(irc:channel-users conn (second params)))]
+
+	  [#t
+	   (make-message-file conn ".server" "server" (last params))]))
 
 
 (define *help-msg*
@@ -181,8 +190,8 @@
 	(name
 	 "Set the realname of your connection."
 	 (value (required NAME)))
-	(output
-	 "Output path for messages. Defaults to standard output."
+	(directory
+	 "Root directory for channels and messages. Defaults to CWD."
 	 (single-char #\o)
 	 (value (required PATH)))))
 
@@ -212,7 +221,7 @@
 		 [hostname (first (string-split server ":"))]
 		 [port (or (string->number (last (string-split server ":")))
 				   6697)]
-		 [output (alist-ref 'output args)]
+		 [directory (or (alist-ref 'directory args) "./")]
 		 [connection (if server
 						 (irc:connect server port username nickname password fullname)
 						 #f)])
@@ -220,8 +229,7 @@
 	  (unless connection
 		(help))
 
-	  (if output
-		  (hash-table-set! connection 'output output))
+	  (hash-table-set! connection 'directory directory)
 
 	  (irc:loop connection
 				on-command
