@@ -1,5 +1,5 @@
 ;;
-;; Copyright 2022, Jaidyn Levesque <jadedctrl@posteo.at>
+;; Copyright 2023, Jaidyn Levesque <jadedctrl@posteo.at>
 ;;
 ;; This program is free software: you can redistribute it and/or
 ;; modify it under the terms of the GNU General Public License as
@@ -17,12 +17,39 @@
 
 (import scheme
 		(chicken file) (chicken file posix) (chicken io) (chicken keyword) (chicken random)
+		(chicken pathname)
 		(chicken pretty-print) (chicken process-context)
 		(chicken process-context posix) (chicken string)
-		srfi-1 srfi-13 srfi-19 srfi-69 srfi-180
+		srfi-1 srfi-13 srfi-18 srfi-19 srfi-69 srfi-180
+		inotify
 		ircc
 		xattr
 		getopt-long)
+
+
+;; Wrapper around `directory` that lists a dir's files as a relative path
+(define (directory-rel #!optional (path "./"))
+  (let ([relative-parent (normalize-pathname (string-append path "/"))])
+	(map (lambda (leaf)
+		   (string-append relative-parent leaf))
+		 (directory path))))
+
+
+;; Returns an inotify watch-descriptor according the given path
+(define (path->wd path)
+  (car
+   (filter (lambda (wd)
+			 (string=? (normalize-pathname (wd->path wd))
+					   (normalize-pathname path)))
+		   (wd-list))))
+
+
+;; Attempt to remove an inotify watch; if it's already been removed, no sweat
+;; (This happens sometimes when inotify automatically deletes a watch)
+(define (attempt-remove-watch! watch)
+  (handle-exceptions exn
+	  #t
+	(remove-watch! watch)))
 
 
 ;; Returns the path of a channel's directory
@@ -67,10 +94,12 @@
 
 ;; Creates a channel's file hierarchy, if need be
 (define (make-channel conn channel)
-  (let ([path (channel-directory-path conn channel)])
-	(create-directory (string-append path "/.users/online") #t)
-	(create-directory (string-append path "/.users/offline") #t)
-	(create-directory (string-append path "/.users/all") #t)
+  (let* ([path (channel-directory-path conn channel)]
+		 [subpath (lambda (leaf) (string-append path leaf))])
+	(create-directory (subpath ".in") #t)
+	(create-directory (subpath ".users/online") #t)
+	(create-directory (subpath ".users/offline") #t)
+	(create-directory (subpath ".users/all") #t)
 	(cleanup-channel conn channel)))
 
 
@@ -81,7 +110,8 @@
 
 ;; Disables a user-state (that is, removes a symlink from a .users directory
 (define (user-disable-state conn channel hostmask state)
-  (let ([state-link (channel-user-directory-path conn channel hostmask state)])
+  (let ([state-link
+		 (create-directory (channel-user-directory-path conn channel hostmask state) #t)])
 	(if (or (file-exists? state-link)
 			(symbolic-link? state-link))
 		(delete-file state-link))))
@@ -89,7 +119,8 @@
 
 ;; Enables a user-state (that is, makes a symlink to a .users directory
 (define (user-enable-state conn channel hostmask state)
-  (let ([state-link (channel-user-directory-path conn channel hostmask state)])
+  (let ([state-link
+		 (create-directory (channel-user-directory-path conn channel hostmask state) #t)])
 	(if (not (or (file-exists? state-link)
 				 (symbolic-link? state-link)))
 		(create-symbolic-link (string-append "../all/" hostmask)
@@ -138,6 +169,12 @@
 		(set-xattr topic-path "user.chat.sender" (irc:hostmask-nick username)))))
 
 
+;; Join an IRC channel
+(define (join-channel connection channel)
+  (irc:write-cmd connection "JOIN" channel)
+  (make-channel connection channel))
+
+
 ;; Hook function for irc:loop; handles all IRC commands
 (define (on-command conn cmd params #!optional sender)
   (cond
@@ -169,9 +206,6 @@
 ;; Hook function for irc:loop; handles all IRC errors and replies
 (define (on-reply conn reply params #!optional sender)
   (cond
-      [(eq? reply RPL_WELCOME)
-	   (irc:write-cmd conn "JOIN" "#thevoid")]
-
 	  ;; If topic set, output to a channel's .topic file
 	  [(and (eq? reply RPL_TOPIC)
 			(irc:channel? (second params)))
@@ -240,6 +274,112 @@
   (exit 1))
 
 
+(define (wait-for-registration connection)
+  (if (not (hash-table-exists? connection 'registered))
+	  (begin
+		(thread-sleep! .1)
+		(wait-for-registration connection))
+	  #t))
+
+
+;; Initialization for the input loop
+(define (input-loop-init connection)
+  (let ([irc-dir (hash-table-ref connection 'directory)])
+	(init!)
+	;; Start watching top-level IRC dir (for new channel joins, etc)
+	(add-watch! irc-dir
+				'(onlydir moved-to moved-from delete delete-self create))
+
+
+	;; Can't actually join channels below, unless we're connected! :P
+	(wait-for-registration connection)
+
+	;; Start watching input dirs of all pre-existing channel dirs
+	(map (lambda (path)
+		   (let ([in-path (normalize-pathname (string-append path "/.in"))]
+				 [dirname (pathname-file (pathname-directory (string-append path "/")))])
+			 (join-channel connection dirname)
+
+			 (add-watch! in-path '(moved-to close-write))
+			 (print "Joined and watching: " in-path)))
+		 (filter directory-exists? (directory-rel irc-dir)))))
+
+
+;; Handles all inotify-watched file events from the top-level IRC-directory.
+;; Mainly, checking for newly-joined or left channels.
+(define (handle-main-dir-event connection event)
+  (let ([flags (event-flags event)])
+	(cond
+	 ;; If a channel dir's been moved or removed, stop watching (ofc)
+	 ;; … Also quit that room! Heck them!
+	 [(or (member 'moved-from flags)
+		  (member 'delete flags)
+		  (member 'delete-self flags))
+	  (let* ([channel (event-name event)]
+			 [channel-inpath (string-append (wd->path (event-wd event)) channel "/.in")]
+			 [channel-wd (path->wd channel-inpath)])
+		(print "Leaving " channel "…")
+		(print "Remove watch for " channel-inpath "…")
+
+		(if (and channel-wd (member channel-wd (wd-list)))
+			(attempt-remove-watch! channel-wd))
+		(if (member channel (irc:channels connection))
+			(irc:write-cmd connection "PART" channel)))]
+
+	 ;; If a dir's been created for a channel, maybe-join, then watch input!
+	 [(or (member 'create flags)
+		  (member 'moved-to flags))
+	  (let* ([path (event->pathname event)]
+			 [in-path (normalize-pathname (string-append path "/.in"))]
+			 [dirname (pathname-file (pathname-directory (string-append path "/")))])
+		(print "Joining channel " dirname "…")
+		(join-channel connection dirname)
+
+		(add-watch! in-path '(moved-to close-write))
+		(print "Began watching input " in-path "."))])))
+
+
+;; Handles an inotify event that pertains to a channel's .in/ directory
+(define (handle-channel-dir-event connection event)
+  (let* ([event-dir (pathname-directory (event->pathname event))]
+		 [dirname (pathname-file (pathname-directory event-dir))]
+		 [parent-dirname (pathname-file (pathname-directory (pathname-directory event-dir)))])
+	(cond
+	 ;; If input is given to an `.in` dir, and its channel is still valid…
+	 ;; well, send that darn message! What're you waiting for?!
+	 [(and (string=? dirname ".in")
+		   (member parent-dirname (irc:channels connection)))
+	  (print "INPUT FROM, to channel " event-dir)]
+
+	 ;; If input is given to `.in`, but its channel is invalid… let's give up.
+	 [(string=? dirname ".in")
+	  (print "Removing watch on " dirname "…")
+	  (attempt-remove-watch! (event-wd event))])))
+
+
+;; Handle a single inotify file event, as part of the input loop
+(define (handle-file-event connection event)
+  (if (not (member 'ignored (event-flags event)))
+	  (let* ([flags (event-flags event)]
+			 [wd-path (wd->path (event-wd event))]
+			 [main-dir? (string=? wd-path (hash-table-ref connection 'directory))])
+		(if main-dir?
+			(handle-main-dir-event connection event)
+			(handle-channel-dir-event connection event)))))
+
+
+;; The FS-backed input loop, to be run in a seperate thread (so as to not block)
+;; This handles channel leaving/joining, and sending messages
+(define (input-loop connection #!optional (init #f))
+  (if (not init)
+	  (input-loop-init connection))
+
+  (map (lambda (event) (handle-file-event connection event))
+	   (next-events!))
+
+  (input-loop connection #t))
+
+
 ;; The `main` procedure that should be called to run feedsnake-unix for use as script.
 (define (main)
   (let* ([args (getopt-long (command-line-arguments) *opts*)]
@@ -266,8 +406,17 @@
 	  (unless connection
 		(help))
 
-	  (hash-table-set! connection 'directory directory)
+	  (hash-table-set! connection 'directory
+					   (normalize-pathname (string-append directory "/")))
 
+	  ;; Kick off the input loop, which monitors channels' .in/ dirs
+	  (thread-start!
+	   (make-thread
+		(lambda ()
+		  (input-loop connection))
+		"Chat input"))
+
+	  ;; Kick off the mani loop!
 	  (irc:loop connection
 				on-command
 				on-reply))))
