@@ -175,6 +175,14 @@
   (make-channel connection channel))
 
 
+;; Send message to an IRC channel
+(define (send-message connection channel message)
+  (irc:write-cmd connection "PRIVMSG" channel message)
+  (make-message-file connection channel
+					 (hash-table-ref connection 'nick)
+					 message))
+
+
 ;; Hook function for irc:loop; handles all IRC commands
 (define (on-command conn cmd params #!optional sender)
   (cond
@@ -342,14 +350,19 @@
 ;; Handles an inotify event that pertains to a channel's .in/ directory
 (define (handle-channel-dir-event connection event)
   (let* ([event-dir (pathname-directory (event->pathname event))]
-		 [dirname (pathname-file (pathname-directory event-dir))]
-		 [parent-dirname (pathname-file (pathname-directory (pathname-directory event-dir)))])
+		 [dirname (pathname-file event-dir)]
+		 [parent-dirname (pathname-file (pathname-directory event-dir))])
 	(cond
 	 ;; If input is given to an `.in` dir, and its channel is still valid…
-	 ;; well, send that darn message! What're you waiting for?!
+	 ;; well, send that darn message(s)! What're you waiting for?!
 	 [(and (string=? dirname ".in")
 		   (member parent-dirname (irc:channels connection)))
-	  (print "INPUT FROM, to channel " event-dir)]
+	  (print "Sending message(s) [" (event->pathname event) "] to " parent-dirname "…")
+	  (map (lambda (message)
+			 (send-message connection parent-dirname message))
+		   (with-input-from-file (event->pathname event)
+			 read-lines))
+	  (delete-file* (event->pathname event))]
 
 	 ;; If input is given to `.in`, but its channel is invalid… let's give up.
 	 [(string=? dirname ".in")
