@@ -56,7 +56,7 @@
 ;; Hook function for irc:loop; handles all IRC commands
 (define (make-irc-command-callback conn)
   (let ([root-dir (hash-table-ref conn 'directory)])
-    (lambda (conn cmd params #!optional sender)
+    (lambda (conn cmd params #!optional sender tags)
       (cond
        [(and (string=? cmd "PRIVMSG")
              (string? sender)
@@ -94,21 +94,23 @@
 ;; Hook function for irc:loop; handles all IRC errors and replies
 (define (make-irc-reply-callback conn)
   (let ([root-dir (hash-table-ref conn 'directory)])
-    (lambda (conn reply params #!optional sender)
+    (lambda (conn reply params #!optional sender tags)
       (let ([channel (second params)])
         (cond
          ;; If topic set, output to a channel's .topic file
         [(and (eq? reply RPL_TOPIC)
-               (irc:channel? channel))
+              (irc:channel? channel))
           (chatdir:channel-metadata-set! root-dir channel
                                          "topic" (last params))]
 
-         [(and (eq? reply RPL_TOPICWHOTIME)
-               (irc:channel? (second params)))
-          (chatdir:channel-metadata-set! root-dir channel
-                                         "topic" #f
-                                         `((user.chat.sender . ,(third params))
-                                           (user.chat.date . ,(last params))))]
+        [(and (eq? reply RPL_TOPICWHOTIME)
+              (irc:channel? (second params)))
+         (chatdir:channel-metadata-set!
+          root-dir channel "topic" #f
+          (if (last params)
+              `((user.chat.sender . ,(third params))
+                (user.chat.date . ,(last params)))
+              `((user.chat.sender . ,(third params)))))]
 
          ;; We've got to add users, when they join the room!
          [(or (and (irc:capability? conn 'userhost-in-names)
