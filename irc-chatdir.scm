@@ -21,7 +21,7 @@
 ;;
 
 (import scheme
-        (chicken file) (chicken io) (chicken pathname)
+        (chicken file) (chicken file posix) (chicken io) (chicken pathname)
         (chicken process-context) (chicken process-context posix)
         (chicken string)
         srfi-1 srfi-18 srfi-69
@@ -95,34 +95,33 @@
 (define (make-irc-reply-callback conn)
   (let ([root-dir (hash-table-ref conn 'directory)])
     (lambda (conn reply params #!optional sender)
-      (cond
-       ;; If topic set, output to a channel's .topic file
-       [(and (eq? reply RPL_TOPIC)
-             (irc:channel? (second params)))
-        (chatdir:channel-metadata-set! root-dir (second params)
-                                       "topic" (last params))]
+      (let ([channel (second params)])
+        (cond
+         ;; If topic set, output to a channel's .topic file
+        [(and (eq? reply RPL_TOPIC)
+               (irc:channel? channel))
+          (chatdir:channel-metadata-set! root-dir channel
+                                         "topic" (last params))]
 
-       [(and (eq? reply RPL_TOPICWHOTIME)
-             (irc:channel? (second params)))
-        (chatdir:channel-metadata-set! root-dir (second params)
-                                       "topic" #f
-                                       `((user.chat.sender . ,(third params))
-                                         (user.chat.date . ,(last params))))]
+         [(and (eq? reply RPL_TOPICWHOTIME)
+               (irc:channel? (second params)))
+          (chatdir:channel-metadata-set! root-dir channel
+                                         "topic" #f
+                                         `((user.chat.sender . ,(third params))
+                                           (user.chat.date . ,(last params))))]
 
-       ;; We've got to add users, when they join the room!
-       [(or (and (irc:capability? conn 'userhost-in-names)
-                 (eq? reply RPL_ENDOFNAMES))
-            (eq? reply RPL_ENDOFWHO))
-        (map (lambda (nick)
-               (let ([hostmask (irc:user-get conn nick 'hostmask)]
-                     [channel (second params)])
-                 (chatdir:channel-user-add! root-dir channel nick)
-                 (chatdir:channel-user-toggle-states! root-dir channel nick
-                                                      "online" "offline")))
-             (irc:channel-users conn (second params)))]
-
-       [#t
-        (chatdir:channel-message-add! root-dir ".server" (last params) "server")]))))
+         ;; We've got to add users, when they join the room!
+         [(or (and (irc:capability? conn 'userhost-in-names)
+                   (eq? reply RPL_ENDOFNAMES))
+              (eq? reply RPL_ENDOFWHO))
+          (map (lambda (nick)
+                 (let ([hostmask (irc:user-get conn nick 'hostmask)])
+                   (chatdir:channel-user-add! root-dir channel nick)
+                   (chatdir:channel-user-toggle-states! root-dir channel nick
+                                                        "online" "offline")))
+               (irc:channel-users conn (second params)))]
+         [(string? (last params))
+          (chatdir:channel-message-add! root-dir ".server" (last params))])))))
 
 
 (define *help-msg*
@@ -226,7 +225,7 @@
 	  ;; Kick off the main loop!
 	  (irc:loop connection
 				(make-irc-command-callback connection)
-				(make-irc-reply-callback connection)))))
+				(make-irc-reply-callback connection))))
 
 
 (main)
