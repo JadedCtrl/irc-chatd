@@ -126,7 +126,7 @@
 
 (define *help-msg*
   (string-append
-   "usage: irc-chatd [-h] [-n nick] [-u user] [-p password] hostname\n\n"
+   "usage: irc-chatd [-hd] [-n nick] [-u user] [-p password] hostname\n\n"
    "`chatd` is a standard format for chat client-daemons; the goal being that a\n"
    "chat client should be able to work with any chat protocol (IRC, XMPP, etc)\n"
    "just by reading and writing to files served by a `chatd` daemon, without\n"
@@ -158,7 +158,10 @@
 	(directory
 	 "Root directory for channels and messages. Defaults to CWD."
 	 (single-char #\o)
-	 (value (required PATH)))))
+	 (value (required PATH)))
+    (debug
+     (single-char #\d)
+     "Print all messages received from the IRC server.")))
 
 
 ;; Prints cli usage to stderr.
@@ -225,7 +228,8 @@
 	  ;; Kick off the main loop!
 	  (irc:loop connection
 				(make-irc-command-callback connection)
-				(make-irc-reply-callback connection))))
+				(make-irc-reply-callback connection)
+                (alist-ref 'debug args)))))
 
 
 (main)
