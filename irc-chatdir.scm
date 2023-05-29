@@ -70,14 +70,22 @@
        [(or (string=? cmd "NOTICE")
             (and (string=? cmd "PRIVMSG")
                  (or (string-null? sender) (not (irc:hostmask? sender)))))
-        (chatdir:channel-message-add! root-dir ".server" (last params) "server")]
+        (chatdir:channel-message-add! root-dir ".server" (last params))]
 
        [(and (string=? cmd "JOIN") (irc:user-is-self? conn sender))
         (chatdir:channel-add! root-dir (last params))]
 
        [(string=? cmd "JOIN")
-        (chatdir:channel-user-add! root-dir (last params) sender)]))))
+        (let ([channel (car params)]
+              [nick (irc:hostmask-nick sender)])
+          (chatdir:channel-user-add! root-dir channel nick)
+          (chatdir:channel-user-toggle-states! root-dir channel nick
+                                               "online" "offline"))]
 
+       [(string=? cmd "PART")
+        (chatdir:channel-user-toggle-states!
+         root-dir (car params) (irc:hostmask-nick sender)
+         "offline" "online")]))))
     ;;   [(string=? cmd "NICK")
     ;; (chatd-json-write conn
 ;;	 (compose-event-alist conn "user-info" #:user (last params)))])
