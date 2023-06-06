@@ -24,7 +24,7 @@
         (chicken file) (chicken file posix) (chicken io) (chicken pathname)
         (chicken process-context) (chicken process-context posix)
         (chicken string)
-        srfi-1 srfi-18 srfi-69
+        srfi-1 srfi-13 srfi-18 srfi-69
         (prefix chatdir chatdir:) (prefix chatdir-inotify chatdir:)
         ircc
         getopt-long)
@@ -60,12 +60,20 @@
       (cond
        [(and (string=? cmd "PRIVMSG")
              (string? sender)
+             (irc:channel? (car params))
              (irc:hostmask? sender))
         (let ([target (if (irc:user-is-self? conn (car params))
                           (irc:hostmask-nick sender)
                           (car params))])
           (chatdir:channel-message-add! root-dir target
                                         (last params) (irc:hostmask-nick sender)))]
+
+       [(and (string=? cmd "PRIVMSG")
+             (string? sender)
+             (irc:hostmask? sender))
+        (chatdir:channel-add! root-dir (irc:hostmask-nick sender))
+        (chatdir:channel-message-add! root-dir (irc:hostmask-nick sender)
+                                      (last params) (irc:hostmask-nick sender))]
 
        [(or (string=? cmd "NOTICE")
             (and (string=? cmd "PRIVMSG")
